@@ -21,6 +21,11 @@ LIBUSB_API const struct usb_version *usb_get_version(void)
   return &_usb_version;
 }
 
+void usbwine_set_last_error(unsigned int code)
+{
+  SetLastError(code);
+}
+
 /* DLL main entry point */
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
 {

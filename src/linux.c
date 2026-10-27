@@ -13,11 +13,26 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <time.h>
 #include <dirent.h>
+#include <sys/eventfd.h>
+#include <linux/usbdevice_fs.h>
 
 #include "linux.h"
 #include "usbi.h"
+#include "usb-wine.h"
+
+/* linux.h declares the kernel's usbfs structures itself: check them */
+_Static_assert(sizeof(struct usb_urb) == sizeof(struct usbdevfs_urb), "usb_urb");
+_Static_assert(sizeof(struct usb_bulktransfer) == sizeof(struct usbdevfs_bulktransfer),
+	"usb_bulktransfer");
+_Static_assert(IOCTL_USB_SUBMITURB == USBDEVFS_SUBMITURB, "IOCTL_USB_SUBMITURB");
+_Static_assert(IOCTL_USB_DISCARDURB == USBDEVFS_DISCARDURB, "IOCTL_USB_DISCARDURB");
+_Static_assert(IOCTL_USB_REAPURBNDELAY == USBDEVFS_REAPURBNDELAY, "IOCTL_USB_REAPURBNDELAY");
+_Static_assert(IOCTL_USB_BULK == USBDEVFS_BULK, "IOCTL_USB_BULK");
 
 /*
  * libusb-win32's timeout error (from its error.h), the value Windows
@@ -25,7 +40,17 @@
  */
 #define ETRANSFER_TIMEDOUT 116
 
+#define TRACE(level, format, args...) \
+	do { \
+	  if (usb_debug >= (level)) \
+	    fprintf(stderr, "libusb0: " format "\n", ## args); \
+	} while (0)
+
 static char usb_path[PATH_MAX + 1] = "";
+
+/* per-device state for the asynchronous API, at the end of this file */
+static int async_open(usb_dev_handle *dev);
+static int async_close(usb_dev_handle *dev);
 
 /*
  * libusb-win32 reports every failure as one of four errors
@@ -96,14 +121,28 @@ static int device_open(struct usb_device *dev)
 
 int usb_os_open(usb_dev_handle *dev)
 {
-  dev->fd = device_open(dev->device);
+  int ret;
 
-  return 0;
+  dev->fd = device_open(dev->device);
+  if (dev->fd < 0)
+    return 0;
+
+  ret = async_open(dev);
+  if (ret < 0) {
+    close(dev->fd);
+    dev->fd = -1;
+  }
+  return ret;
 }
 
 int usb_os_close(usb_dev_handle *dev)
 {
   if (dev->fd < 0)
+    return 0;
+
+  /* if a thread cannot be got out of usb_reap_async(), the file stays
+     open for it: see async_close() */
+  if (async_close(dev) < 0)
     return 0;
 
   if (close(dev->fd) == -1)
@@ -711,185 +750,582 @@ LIBUSB_API int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface)
   return 0;
 }
 
+/* ------------------------------------------------------------------------
+ * Asynchronous transfers
+ *
+ * libusb-win32 builds its asynchronous API on overlapped I/O:
+ * usb_submit_async() starts a driver request, usb_reap_async() waits for
+ * its event with WaitForSingleObject() and collects the result with
+ * GetOverlappedResult(). What follows gives Windows programs the same
+ * behaviour:
+ *
+ * - The timeout is WaitForSingleObject()'s: 0 checks without waiting, and
+ *   a negative one (INFINITE) waits for as long as it takes. When it runs
+ *   out, usb_reap_async() cancels the request and usb_reap_async_nocancel()
+ *   leaves it running; both return -ETRANSFER_TIMEDOUT.
+ * - A finished request stays finished: reaping it again gives the same
+ *   result, until the context is submitted again.
+ * - usb_cancel_async() aborts every request on the context's endpoint, as
+ *   libusb-win32's ABORT_ENDPOINT does, and returns once they have
+ *   stopped. They then reap as -ETRANSFER_TIMEDOUT.
+ * - A failed reap leaves a Win32 error for GetLastError(), as
+ *   GetOverlappedResult() would: ERROR_OPERATION_ABORTED for a request
+ *   that was cancelled or lost to an unplug, ERROR_GEN_FAILURE when the
+ *   transfer itself failed. After a plain timeout Windows leaves whatever
+ *   error was there before; this sets ERROR_SEM_TIMEOUT instead, because a
+ *   stale ERROR_OPERATION_ABORTED makes ANT_DLL think the stick is gone.
+ * - usb_close() ends whatever is still pending as aborted, as closing the
+ *   file handle does on Windows, and wakes the threads waiting on it.
+ *
+ * usbfs keeps one completion queue per open file: whoever reaps gets the
+ * next finished URB, whichever thread submitted it. So all reaping is done
+ * by drain_locked(), under the device's lock, which files every result
+ * with the request it belongs to. Threads waiting for a result take turns
+ * to sleep in poll() on the device; see wait_for().
+ */
 
-// -------------------------------------------------------------------------------
-// this async functions added by some person who'd like to remain anonymous
-// It was necessary to make Aerodrums application run under wine.
+struct usb_async;
 
-typedef struct {
-	usb_dev_handle *dev;
-	char *bytes;
-	int size;
-	struct usb_urb urb;
-	int reaped;
-} usb_context_t;
+/* Per-device state, in usb_dev_handle.impl_info */
+struct linux_handle {
+  int fd;			/* the device, as in dev->fd */
+  pthread_mutex_t lock;		/* guards all of this and every request */
+  pthread_cond_t cond;		/* broadcast when results are filed, when
+				   the thread in poll() leaves it, on close */
+  int wake_fd;			/* eventfd that wakes the thread in poll() */
+  int polling;			/* a thread is in poll() on fd */
+  int waiters;			/* threads inside wait_for() */
+  int gone;			/* the device has been unplugged */
+  int closing;			/* usb_close() is under way; nobody reaps */
+  struct usb_async *requests;	/* every context set up on the device */
+};
 
-static int _usb_setup_async(usb_dev_handle *dev, void **context,
-                            int urbtype,
-                            unsigned char ep, int pktsize)
+enum { ASYNC_IDLE, ASYNC_PENDING, ASYNC_DONE };
+
+/* What a libusb-win32 context points to */
+struct usb_async {
+  struct usb_urb urb;		/* the kernel names a finished URB by address */
+  usb_dev_handle *dev;		/* NULL once the device is closed */
+  struct usb_async *next;
+  unsigned char ep;
+  int state;
+  int result;			/* bytes transferred, or a negative error */
+  unsigned int last_error;	/* for GetLastError() when result < 0 */
+  int orphaned;			/* freed by the program while still pending */
+};
+
+static struct linux_handle *handle_of(usb_dev_handle *dev)
 {
-	usb_context_t **c = (usb_context_t **)context;
+  return dev ? dev->impl_info : NULL;
+}
 
-	/* Any error checks required here? */
+static void unlink_request(struct linux_handle *h, struct usb_async *c)
+{
+  struct usb_async **p;
 
-	*c = malloc(sizeof(usb_context_t));
+  for (p = &h->requests; *p; p = &(*p)->next)
+    if (*p == c) {
+      *p = c->next;
+      break;
+    }
+  c->next = NULL;
+}
 
-	if (!*c) {
-		USB_ERROR_STR(-errno, "memory allocation error: %s\n", strerror(errno));
-		return -ENOMEM;
-	}
+static void finish(struct usb_async *c, int result, unsigned int last_error)
+{
+  c->state = ASYNC_DONE;
+  c->result = result;
+  c->last_error = last_error;
+}
 
-	memset(*c, 0, sizeof(usb_context_t));
+/* Wake every thread waiting on the device, the one in poll() included. */
+static void wake_locked(struct linux_handle *h)
+{
+  static const uint64_t one = 1;
 
-	(*c)->dev = dev;
-	(*c)->urb.type = urbtype;
-	(*c)->urb.endpoint = ep;
-	(*c)->urb.flags = 0;
-	(*c)->urb.signr = 0;
-	(*c)->urb.actual_length = 0;
-	(*c)->urb.number_of_packets = 0;	/* don't do isochronous yet */
-	(*c)->urb.usercontext = NULL;
+  pthread_cond_broadcast(&h->cond);
+  if (h->polling && write(h->wake_fd, &one, sizeof(one)) < 0) {
+    /* the count is already non-zero: the poller is waking up anyway */
+  }
+}
 
-	return 0;
+/*
+ * File a finished URB the way libusb-win32 reports a finished request.
+ * Data that arrived is delivered, even when the request was then cut
+ * short. A request that was cancelled, or lost when the device went away,
+ * fails on Windows with ERROR_OPERATION_ABORTED, which libusb-win32
+ * returns as -ETRANSFER_TIMEDOUT; ANT_DLL checks for exactly that pair.
+ */
+static void complete_locked(struct linux_handle *h, struct usb_async *c)
+{
+  int status = c->urb.status, length = c->urb.actual_length;
+
+  if (status == 0 || length > 0)
+    finish(c, length, 0);
+  else if (status == -ENOENT || status == -ECONNRESET ||
+           status == -ESHUTDOWN || status == -ENODEV)
+    finish(c, -ETRANSFER_TIMEDOUT, USBWINE_ERROR_OPERATION_ABORTED);
+  else
+    finish(c, -EIO, USBWINE_ERROR_GEN_FAILURE);
+
+  TRACE(4, "ep 0x%02x: request finished, status %d, %d bytes", c->ep,
+        status, length);
+
+  if (c->orphaned) {
+    unlink_request(h, c);
+    free(c);
+  }
+}
+
+/*
+ * Reap every URB that has finished on the device and file each with its
+ * request. Never blocks.
+ */
+static void drain_locked(struct linux_handle *h)
+{
+  int filed = 0;
+
+  if (h->closing)
+    return;
+
+  for (;;) {
+    struct usb_urb *urb = NULL;
+    struct usb_async *c;
+
+    if (ioctl(h->fd, IOCTL_USB_REAPURBNDELAY, &urb) < 0) {
+      if (errno == ENODEV)
+        h->gone = 1;		/* unplugged, and nothing left to reap */
+      break;
+    }
+    for (c = h->requests; c && &c->urb != urb; c = c->next)
+      ;
+    if (!c) {
+      TRACE(1, "reaped a URB that no request owns");
+      continue;
+    }
+    complete_locked(h, c);
+    filed = 1;
+  }
+
+  if (filed)
+    wake_locked(h);
+}
+
+/* Have the kernel stop c; it lands among the finished URBs right away. */
+static void discard_locked(struct linux_handle *h, struct usb_async *c)
+{
+  /* EINVAL: it had already finished, ENODEV: the device is gone */
+  if (ioctl(h->fd, IOCTL_USB_DISCARDURB, &c->urb) < 0 &&
+      errno != EINVAL && errno != ENODEV)
+    TRACE(1, "ep 0x%02x: could not discard a request: %s", c->ep,
+          strerror(errno));
+}
+
+/* Stop every request pending on the endpoint, and collect them. */
+static void abort_endpoint_locked(struct linux_handle *h, unsigned char ep)
+{
+  struct usb_async *c;
+
+  for (c = h->requests; c; c = c->next)
+    if (c->state == ASYNC_PENDING && c->ep == ep)
+      discard_locked(h, c);
+  drain_locked(h);
+}
+
+/*
+ * Sleep on the condition variable until woken or the deadline passes
+ * (NULL: no deadline), and for at most nap_ms if that is above 0.
+ */
+static void sleep_locked(struct linux_handle *h,
+	const struct timespec *deadline, int nap_ms)
+{
+  struct timespec nap;
+
+  if (nap_ms > 0) {
+    deadline_in(&nap, nap_ms);
+    if (!deadline || deadline->tv_sec > nap.tv_sec ||
+        (deadline->tv_sec == nap.tv_sec && deadline->tv_nsec > nap.tv_nsec))
+      deadline = &nap;
+  }
+  if (deadline)
+    pthread_cond_timedwait(&h->cond, &h->lock, deadline);
+  else
+    pthread_cond_wait(&h->cond, &h->lock);
+}
+
+/*
+ * Sleep in poll() until a URB finishes, wake_locked() is called or ms
+ * milliseconds pass (-1: no limit), with the lock dropped meanwhile.
+ */
+static void poll_locked(struct linux_handle *h, int ms)
+{
+  struct pollfd fds[2];
+  uint64_t count;
+  int n;
+
+  h->polling = 1;
+  pthread_mutex_unlock(&h->lock);
+
+  fds[0].fd = h->fd;		/* usbfs: writable = a finished URB to reap */
+  fds[0].events = POLLOUT;
+  fds[0].revents = 0;
+  fds[1].fd = h->wake_fd;
+  fds[1].events = POLLIN;
+  fds[1].revents = 0;
+  n = poll(fds, 2, ms);
+  if (n > 0 && (fds[1].revents & POLLIN) &&
+      read(h->wake_fd, &count, sizeof(count)) < 0) {
+    /* nothing to clear */
+  }
+
+  pthread_mutex_lock(&h->lock);
+  h->polling = 0;
+  /* usbfs: hung up = unplugged, and poll() no longer waits */
+  if (n > 0 && (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)))
+    h->gone = 1;
+  pthread_cond_broadcast(&h->cond);	/* another waiter may take over */
+}
+
+/*
+ * Wait until c has finished, the deadline has passed (NULL: no deadline)
+ * or the device is being closed. Returns nonzero if c finished. Called,
+ * and returns, with the lock held.
+ *
+ * One waiting thread at a time sleeps in poll() on the device. When it
+ * wakes it files every finished URB with its request; the others sleep on
+ * the condition variable, and one of them takes over poll() when it
+ * leaves. A thread that files someone else's result, or closes the device,
+ * wakes the one in poll() through the eventfd. Nobody sleeps holding the
+ * lock, and no completion can go to the wrong thread.
+ */
+static int wait_for(struct linux_handle *h, struct usb_async *c,
+	const struct timespec *deadline)
+{
+  h->waiters++;
+
+  for (;;) {
+    int ms;
+
+    drain_locked(h);
+    if (c->state == ASYNC_DONE || h->closing)
+      break;
+    ms = deadline ? ms_left(deadline) : -1;
+    if (ms == 0)
+      break;
+
+    if (c->state == ASYNC_IDLE)
+      /* never submitted, so nothing will finish it: a Windows wait on its
+         event just runs out the clock, and so does this one */
+      sleep_locked(h, deadline, 0);
+    else if (h->gone)
+      /* unplugged: the kernel gives everything back within milliseconds,
+         but poll() no longer waits, so nap instead */
+      sleep_locked(h, deadline, 10);
+    else if (h->polling)
+      /* look for itself now and then, in case the thread in poll() is
+         held up (suspended, or killed with TerminateThread) */
+      sleep_locked(h, deadline, 250);
+    else
+      poll_locked(h, ms);
+  }
+
+  h->waiters--;
+  if (h->closing)
+    pthread_cond_broadcast(&h->cond);	/* async_close() waits for this */
+  return c->state == ASYNC_DONE;
+}
+
+static int async_open(usb_dev_handle *dev)
+{
+  struct linux_handle *h;
+  pthread_condattr_t attr;
+  int err;
+
+  h = calloc(1, sizeof(*h));
+  if (!h)
+    USB_ERROR(-ENOMEM);
+  h->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (h->wake_fd < 0) {
+    err = errno;
+    free(h);
+    USB_ERROR_STR(win_error(err), "could not open %s/%s: eventfd: %s",
+      dev->bus->dirname, dev->device->filename, strerror(err));
+  }
+  h->fd = dev->fd;
+  pthread_mutex_init(&h->lock, NULL);
+  pthread_condattr_init(&attr);
+  pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+  pthread_cond_init(&h->cond, &attr);
+  pthread_condattr_destroy(&attr);
+
+  dev->impl_info = h;
+  return 0;
+}
+
+/*
+ * End whatever is still pending, the way closing the file handle does on
+ * Windows: as aborted. Threads waiting in usb_reap_async() return. The
+ * program still owns its contexts and has to free them, but they no
+ * longer refer to the device.
+ *
+ * Returns -1 if a waiting thread did not leave within two seconds (it is
+ * suspended, say). Its lock, its eventfd and the device's file stay open
+ * for it then, rather than being pulled out from under it.
+ */
+static int async_close(usb_dev_handle *dev)
+{
+  struct linux_handle *h = handle_of(dev);
+  struct usb_async *c, *next;
+  struct timespec deadline;
+  int stuck;
+
+  if (!h)
+    return 0;
+  dev->impl_info = NULL;
+
+  pthread_mutex_lock(&h->lock);
+  for (c = h->requests; c; c = c->next)
+    if (c->state == ASYNC_PENDING)
+      discard_locked(h, c);
+  drain_locked(h);
+  h->closing = 1;
+
+  for (c = h->requests; c; c = next) {
+    next = c->next;
+    c->next = NULL;
+    if (c->orphaned) {
+      /* nobody reaps from now on, so the kernel never writes to it again */
+      free(c);
+      continue;
+    }
+    if (c->state == ASYNC_PENDING)
+      finish(c, -ETRANSFER_TIMEDOUT, USBWINE_ERROR_OPERATION_ABORTED);
+    c->dev = NULL;
+  }
+  h->requests = NULL;
+  wake_locked(h);
+
+  deadline_in(&deadline, 2000);
+  while (h->waiters > 0 &&
+         pthread_cond_timedwait(&h->cond, &h->lock, &deadline) != ETIMEDOUT)
+    ;
+  stuck = h->waiters > 0;
+  pthread_mutex_unlock(&h->lock);
+
+  if (stuck) {
+    TRACE(1, "%s/%s: closed with a thread still waiting; its state is kept for it",
+          dev->bus->dirname, dev->device->filename);
+    return -1;
+  }
+
+  pthread_cond_destroy(&h->cond);
+  pthread_mutex_destroy(&h->lock);
+  close(h->wake_fd);
+  free(h);
+  return 0;
+}
+
+/*
+ * libusb-win32 handles interrupt endpoints just like bulk ones. So does
+ * this: the kernel turns a bulk URB on an interrupt endpoint into an
+ * interrupt transfer, whereas it refuses an interrupt URB on a bulk one.
+ */
+static int setup_async(usb_dev_handle *dev, void **context, unsigned char ep,
+	const char *what)
+{
+  struct linux_handle *h = handle_of(dev);
+  struct usb_async *c;
+
+  if (!context)
+    USB_ERROR_STR(-EINVAL, "%s: invalid context", what);
+  *context = NULL;
+  if (!h)
+    USB_ERROR_STR(-EINVAL, "%s: invalid device handle", what);
+
+  c = calloc(1, sizeof(*c));
+  if (!c)
+    USB_ERROR_STR(-ENOMEM, "%s: out of memory", what);
+  c->dev = dev;
+  c->ep = ep;
+
+  pthread_mutex_lock(&h->lock);
+  c->next = h->requests;
+  h->requests = c;
+  pthread_mutex_unlock(&h->lock);
+
+  *context = c;
+  return 0;
 }
 
 LIBUSB_API int usb_bulk_setup_async(usb_dev_handle *dev, void **context,
 	unsigned char ep)
 {
-	return _usb_setup_async(dev, context, USB_URB_TYPE_BULK, ep, 0);
+  return setup_async(dev, context, ep, "usb_bulk_setup_async");
 }
 
-/*
- * libusb-win32 handles interrupt endpoints exactly like bulk ones. So can
- * we: the kernel turns a bulk URB on an interrupt endpoint into an
- * interrupt transfer, while it refuses an interrupt URB on a bulk one.
- */
 LIBUSB_API int usb_interrupt_setup_async(usb_dev_handle *dev, void **context,
 	unsigned char ep)
 {
-	return _usb_setup_async(dev, context, USB_URB_TYPE_BULK, ep, 0);
+  return setup_async(dev, context, ep, "usb_interrupt_setup_async");
 }
 
-/* Reading and writing are the same except for the endpoint */
 LIBUSB_API int usb_submit_async(void *context, char *bytes, int size)
 {
-	int ret;
+  struct usb_async *c = context;
+  struct linux_handle *h;
+  usb_dev_handle *dev;
+  int err;
 
-	usb_context_t *c = (usb_context_t *)context;
+  if (!c)
+    USB_ERROR_STR(-EINVAL, "usb_submit_async: invalid context");
+  dev = c->dev;
+  h = handle_of(dev);
+  if (!h)
+    USB_ERROR_STR(-EINVAL, "usb_submit_async: device not open");
 
-	c->urb.buffer = bytes;
-	c->urb.buffer_length = size;
-	c->urb.usercontext = c;
-	c->reaped = 0;
+  /* the checks libusb-win32 makes */
+  if (dev->config <= 0)
+    USB_ERROR_STR(-EINVAL, "usb_submit_async: invalid configuration %d",
+      dev->config);
+  if (dev->interface < 0)
+    USB_ERROR_STR(-EINVAL, "usb_submit_async: invalid interface %d",
+      dev->interface);
 
-	ret = ioctl(c->dev->fd, IOCTL_USB_SUBMITURB, &c->urb);
-	if (ret < 0) {
-		USB_ERROR_STR(-errno, "error submitting URB: %s", strerror(errno));
-		return ret;
-	}
+  pthread_mutex_lock(&h->lock);
+  if (c->state == ASYNC_PENDING) {
+    pthread_mutex_unlock(&h->lock);
+    USB_ERROR_STR(-EINVAL, "usb_submit_async: a request is already pending");
+  }
 
-	return 0;
+  /* like ResetEvent(): until this one finishes, reaps wait */
+  c->state = ASYNC_IDLE;
+  memset(&c->urb, 0, sizeof(c->urb));
+  c->urb.type = USB_URB_TYPE_BULK;	/* see setup_async() */
+  c->urb.endpoint = c->ep;
+  c->urb.buffer = bytes;
+  c->urb.buffer_length = size;
+
+  if (ioctl(h->fd, IOCTL_USB_SUBMITURB, &c->urb) < 0) {
+    err = errno;
+    if (err == ENODEV)
+      h->gone = 1;
+    pthread_mutex_unlock(&h->lock);
+    USB_ERROR_STR(win_error(err), "usb_submit_async: ep 0x%02x: %s", c->ep,
+      strerror(err));
+  }
+  c->state = ASYNC_PENDING;
+  pthread_mutex_unlock(&h->lock);
+
+  TRACE(4, "ep 0x%02x: request submitted, %d bytes", c->ep, size);
+  return 0;
 }
 
-static int _usb_reap_async(void *context, int timeout, int cancel)
+static int reap(void *context, int timeout, int cancel, const char *what)
 {
-	int rc;
-	usb_context_t *c = (usb_context_t *)context;
-	struct usb_urb *urb;
+  struct usb_async *c = context;
+  struct linux_handle *h;
+  struct timespec deadline;
+  unsigned int last_error;
+  int result, finished;
 
-	if (c->reaped)
-		return c->urb.actual_length;
+  if (!c)
+    USB_ERROR_STR(-EINVAL, "%s: invalid context", what);
 
-again:
-	rc = ioctl(c->dev->fd, IOCTL_USB_REAPURB, &urb);
-	if (rc < 0) {
-		fprintf(stderr, "error reaping URB: %s", strerror(errno));
-		return rc;
-	}
+  h = handle_of(c->dev);
+  if (h) {
+    if (timeout >= 0)
+      deadline_in(&deadline, timeout);
 
-	usb_context_t *b = (usb_context_t *)urb->usercontext;
-	if (b != c) {
-		b->reaped = 1;
-		goto again;
-	}
+    pthread_mutex_lock(&h->lock);
+    finished = wait_for(h, c, timeout >= 0 ? &deadline : NULL);
+    if (!finished && cancel && !h->closing && c->state == ASYNC_PENDING) {
+      abort_endpoint_locked(h, c->ep);
+      /* it may have finished, with data, just before the abort */
+      finished = c->state == ASYNC_DONE && c->result >= 0;
+    }
+    if (finished) {
+      result = c->result;
+      last_error = c->last_error;
+    } else {
+      result = -ETRANSFER_TIMEDOUT;
+      last_error = h->closing ? USBWINE_ERROR_OPERATION_ABORTED
+                              : USBWINE_ERROR_SEM_TIMEOUT;
+    }
+    pthread_mutex_unlock(&h->lock);
+  } else if (c->state == ASYNC_DONE) {
+    /* the device is closed; what finished before is still reported */
+    result = c->result;
+    last_error = c->last_error;
+  } else
+    USB_ERROR_STR(-EINVAL, "%s: device not open", what);
 
-#if 0
-	/* Not ready for usb_cancel_async */
-	if (cancel) {
-		usb_cancel_async(context);
-	}
-#else
-	(void)cancel;
-#endif
-	return urb->actual_length;
+  if (result < 0) {
+    usbwine_set_last_error(last_error);
+    USB_ERROR_SET("%s: ep 0x%02x: %s", what, c->ep,
+      last_error == USBWINE_ERROR_SEM_TIMEOUT ? "timeout" :
+      last_error == USBWINE_ERROR_OPERATION_ABORTED ? "request aborted" :
+      "request failed");
+  }
+  return result;
 }
 
 LIBUSB_API int usb_reap_async(void *context, int timeout)
 {
-	return _usb_reap_async(context, timeout, 1);
+  return reap(context, timeout, 1, "usb_reap_async");
 }
 
 LIBUSB_API int usb_reap_async_nocancel(void *context, int timeout)
 {
-	return _usb_reap_async(context, timeout, 0);
+  return reap(context, timeout, 0, "usb_reap_async_nocancel");
 }
-
 
 LIBUSB_API int usb_cancel_async(void *context)
 {
-	printf("%s()\n", __func__);
-	USB_ERROR_STR(-errno, "usb_cancel_async is not yet implemented: %s\n", strerror(errno));
-#if 0
-    /* NOTE that this function will cancel all pending URBs */
-    /* on the same endpoint as this particular context, or even */
-    /* all pending URBs for this particular device. */
+  struct usb_async *c = context;
+  struct linux_handle *h;
 
-    usb_context_t *c = (usb_context_t *)context;
+  if (!c)
+    USB_ERROR_STR(-EINVAL, "usb_cancel_async: invalid context");
+  h = handle_of(c->dev);
+  if (!h)
+    USB_ERROR_STR(-EINVAL, "usb_cancel_async: device not open");
 
-    if (!c)
-    {
-        USBERR0("invalid context\n");
-        return -EINVAL;
-    }
-
-    if (c->dev->impl_info == INVALID_HANDLE_VALUE)
-    {
-        USBERR0("device not open\n");
-        return -EINVAL;
-    }
-
-    _usb_cancel_io(c);
-
-    return 0;
-#endif
-	int rc;
-	usb_context_t *c = (usb_context_t *)context;
-
-	rc = ioctl(c->dev->fd, IOCTL_USB_DISCARDURB, &c->urb);
-	if (rc < 0)
-		fprintf(stderr, "error discarding URB: %s", strerror(errno));
-
-	/*
-	* When the URB is unlinked, it gets moved to the completed list and
-	* then we need to reap it or else the next time we call this function,
-	* we'll get the previous completion and exit early
-	*/
-	ioctl(c->dev->fd, IOCTL_USB_REAPURB, &context);
-
-	return 0;
+  pthread_mutex_lock(&h->lock);
+  abort_endpoint_locked(h, c->ep);
+  pthread_mutex_unlock(&h->lock);
+  return 0;
 }
 
 LIBUSB_API int usb_free_async(void **context)
 {
-	usb_context_t **c = (usb_context_t **)context;
+  struct usb_async *c;
+  struct linux_handle *h;
 
-	if (!*c) {
-		USB_ERROR_STR(-errno, "invalid context: %s\n", strerror(errno));
-		return -EINVAL;
-	}
+  if (!context || !*context)
+    USB_ERROR_STR(-EINVAL, "usb_free_async: invalid context");
+  c = *context;
+  *context = NULL;
 
-	free(*c);
-	*c = NULL;
+  h = handle_of(c->dev);
+  if (h) {
+    pthread_mutex_lock(&h->lock);
+    if (c->state == ASYNC_PENDING) {
+      /* libusb-win32 frees it with the request still running, and the
+         driver writes to the freed memory later. Stop it first. */
+      discard_locked(h, c);
+      drain_locked(h);
+    }
+    if (c->state == ASYNC_PENDING) {
+      /* the kernel still has it (the device is going away): free it when
+         it comes back, or when the device is closed */
+      c->orphaned = 1;
+      pthread_mutex_unlock(&h->lock);
+      return 0;
+    }
+    unlink_request(h, c);
+    pthread_mutex_unlock(&h->lock);
+  }
 
-	return 0;
+  free(c);
+  return 0;
 }

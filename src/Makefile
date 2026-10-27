@@ -23,7 +23,7 @@ CFLAGS = -g -O2 -m32 \
   -Werror=missing-prototypes \
   -Werror=implicit-function-declaration
 
-LDFLAGS = -m32
+LDFLAGS = -m32 -lpthread
 
 OBJS = linux.o error.o usb.o descriptors.o usb-wine.o
 
