@@ -19,6 +19,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/eventfd.h>
+#include <sys/sysmacros.h>
 #include <linux/usbdevice_fs.h>
 
 #include "linux.h"
@@ -33,6 +34,8 @@ _Static_assert(IOCTL_USB_SUBMITURB == USBDEVFS_SUBMITURB, "IOCTL_USB_SUBMITURB")
 _Static_assert(IOCTL_USB_DISCARDURB == USBDEVFS_DISCARDURB, "IOCTL_USB_DISCARDURB");
 _Static_assert(IOCTL_USB_REAPURBNDELAY == USBDEVFS_REAPURBNDELAY, "IOCTL_USB_REAPURBNDELAY");
 _Static_assert(IOCTL_USB_BULK == USBDEVFS_BULK, "IOCTL_USB_BULK");
+_Static_assert(IOCTL_USB_DISCONNECT_CLAIM == USBDEVFS_DISCONNECT_CLAIM,
+	"IOCTL_USB_DISCONNECT_CLAIM");
 
 /*
  * libusb-win32's timeout error (from its error.h), the value Windows
@@ -119,26 +122,79 @@ static int device_open(struct usb_device *dev)
   return fd;
 }
 
+/*
+ * The configuration the device is in, from the value the kernel keeps in
+ * sysfs: no bus traffic, just as libusb-win32 asks its driver for the
+ * cached value. Anything that is not a usbfs device node is asked with a
+ * GET_CONFIGURATION request instead. 0 when unconfigured or unknown, which
+ * is what libusb-win32 falls back to as well.
+ */
+static int active_configuration(int fd)
+{
+  struct usb_ctrltransfer ctrl;
+  unsigned char value = 0;
+  struct stat st;
+  char path[64], buf[16];
+  int f, n;
+
+  if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) {
+    snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/bConfigurationValue",
+      major(st.st_rdev), minor(st.st_rdev));
+    f = open(path, O_RDONLY | O_CLOEXEC);
+    if (f >= 0) {
+      n = read(f, buf, sizeof(buf) - 1);
+      close(f);
+      if (n >= 0) {
+        buf[n] = 0;
+        return atoi(buf);
+      }
+    }
+  }
+
+  memset(&ctrl, 0, sizeof(ctrl));
+  ctrl.bRequestType = USB_ENDPOINT_IN;
+  ctrl.bRequest = USB_REQ_GET_CONFIGURATION;
+  ctrl.wLength = 1;
+  ctrl.timeout = 1000;
+  ctrl.data = &value;
+  if (ioctl(fd, IOCTL_USB_CONTROL, &ctrl) == 1)
+    return value;
+
+  return 0;
+}
+
 int usb_os_open(usb_dev_handle *dev)
 {
   int ret;
 
+  /* libusb-win32's usb_open() fails when the device cannot be opened,
+     instead of handing out a handle on which every call fails */
   dev->fd = device_open(dev->device);
   if (dev->fd < 0)
-    return 0;
+    return dev->fd;
 
   ret = async_open(dev);
   if (ret < 0) {
     close(dev->fd);
     dev->fd = -1;
+    return ret;
   }
-  return ret;
+
+  /* start in the configuration the device is in, as libusb-win32 does,
+     so that asking for that one changes nothing */
+  dev->config = active_configuration(dev->fd);
+
+  return 0;
 }
 
 int usb_os_close(usb_dev_handle *dev)
 {
   if (dev->fd < 0)
     return 0;
+
+  /* libusb-win32 releases the claimed interface on close */
+  if (dev->interface >= 0)
+    usb_release_interface(dev, dev->interface);
 
   /* if a thread cannot be got out of usb_reap_async(), the file stays
      open for it: see async_close() */
@@ -157,8 +213,19 @@ LIBUSB_API int usb_set_configuration(usb_dev_handle *dev, int configuration)
 {
   int ret;
 
-  /* detach kernel driver for windows program ( Stanson <me@stanson.ch > ) */
-  usb_detach_kernel_driver_np(dev, 0);
+  /*
+   * As in libusb-win32: asking for the configuration the device is already
+   * in does nothing, and no interface may be claimed. Linux would reset
+   * the device's endpoints in the first case, and refuses with EBUSY while
+   * a kernel driver holds an interface. The old code here detached the
+   * kernel driver from interface 0 first, on any device a program merely
+   * tried to open.
+   */
+  if (dev->config == configuration)
+    return 0;
+  if (dev->interface >= 0)
+    USB_ERROR_STR(-EINVAL, "could not set config %d: an interface is claimed",
+      configuration);
 
   ret = ioctl(dev->fd, IOCTL_USB_SETCONFIG, &configuration);
   if (ret < 0)
@@ -166,26 +233,79 @@ LIBUSB_API int usb_set_configuration(usb_dev_handle *dev, int configuration)
 	strerror(errno));
 
   dev->config = configuration;
+  dev->interface = -1;
+  dev->altsetting = -1;
 
+  return 0;
+}
+
+/*
+ * Devices that Linux gives a kernel driver and Windows does not: there,
+ * the libusb0 driver has them to itself. Claiming an interface of one of
+ * these takes it from its kernel driver, but never from another program
+ * that has it through usbfs.
+ *
+ * The list is short on purpose, because programs probe: ANT_DLL, which
+ * Zwift and other fitness programs use, claims interface 0 of every device
+ * it is shown just to see whether it can. LIBUSB0_DETACH_KERNEL_DRIVER=1
+ * extends the takeover to every device, and =0 turns it off.
+ */
+static const struct {
+  unsigned short vendor, product;
+} take_from_kernel[] = {
+  { 0x0fcf, 0x1008 },	/* Dynastream ANT USB2 stick: usb_serial_simple */
+  { 0x0fcf, 0x1009 },	/* Dynastream ANT USB-m stick: usb_serial_simple */
+};
+
+static int may_take_from_kernel(struct usb_device *dev)
+{
+  const char *env = getenv("LIBUSB0_DETACH_KERNEL_DRIVER");
+  size_t i;
+
+  if (env && *env)
+    return atoi(env) != 0;
+  for (i = 0; i < sizeof(take_from_kernel) / sizeof(take_from_kernel[0]); i++)
+    if (dev->descriptor.idVendor == take_from_kernel[i].vendor &&
+        dev->descriptor.idProduct == take_from_kernel[i].product)
+      return 1;
   return 0;
 }
 
 LIBUSB_API int usb_claim_interface(usb_dev_handle *dev, int interface)
 {
-  int ret;
+  struct usb_disconnect_claim dc;
+  int ret, err;
+
+  /* the checks libusb-win32 makes */
+  if (!dev->config)
+    USB_ERROR_STR(-EINVAL, "could not claim interface %d: device not configured",
+      interface);
+  if (dev->interface == interface)
+    return 0;
 
   ret = ioctl(dev->fd, IOCTL_USB_CLAIMINTF, &interface);
+  err = errno;
+  if (ret < 0 && err == EBUSY && may_take_from_kernel(dev->device)) {
+    memset(&dc, 0, sizeof(dc));
+    dc.interface = interface;
+    dc.flags = USB_DISCONNECT_CLAIM_EXCEPT_DRIVER;
+    strcpy(dc.driver, "usbfs");
+    ret = ioctl(dev->fd, IOCTL_USB_DISCONNECT_CLAIM, &dc);
+    err = errno;
+    if (ret == 0)
+      TRACE(1, "took interface %d of %s/%s from its kernel driver", interface,
+            dev->bus->dirname, dev->device->filename);
+  }
   if (ret < 0) {
-    int err = errno;
-
-    if (err == EBUSY && usb_debug > 0)
-      fprintf(stderr, "Check that you have permissions to write to %s/%s and, if you don't, that you set up hotplug (http://linux-hotplug.sourceforge.net/) correctly.\n", dev->bus->dirname, dev->device->filename);
-
+    if (err == EBUSY)
+      TRACE(1, "interface %d of %s/%s is in use by a kernel driver or another program",
+            interface, dev->bus->dirname, dev->device->filename);
     USB_ERROR_STR(win_error(err), "could not claim interface %d: %s", interface,
 	strerror(err));
   }
 
   dev->interface = interface;
+  dev->altsetting = 0;
 
   return 0;
 }
@@ -200,6 +320,7 @@ LIBUSB_API int usb_release_interface(usb_dev_handle *dev, int interface)
     	strerror(errno));
 
   dev->interface = -1;
+  dev->altsetting = -1;
 
   return 0;
 }
