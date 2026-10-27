@@ -12,7 +12,8 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <sys/time.h>
+#include <limits.h>
+#include <time.h>
 #include <dirent.h>
 
 #include "linux.h"
@@ -44,6 +45,34 @@ static int win_error(int err)
   default:
     return -EIO;
   }
+}
+
+/* Timeouts run on CLOCK_MONOTONIC, so changing the clock cannot stretch them. */
+static void deadline_in(struct timespec *ts, int ms)
+{
+  clock_gettime(CLOCK_MONOTONIC, ts);
+  ts->tv_sec += ms / 1000;
+  ts->tv_nsec += (long)(ms % 1000) * 1000000L;
+  if (ts->tv_nsec >= 1000000000L) {
+    ts->tv_sec++;
+    ts->tv_nsec -= 1000000000L;
+  }
+}
+
+/* Milliseconds left until ts, rounded up so that a wait never ends early;
+   0 once ts has passed. */
+static int ms_left(const struct timespec *ts)
+{
+  struct timespec now;
+  long long ns;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  ns = (long long)(ts->tv_sec - now.tv_sec) * 1000000000LL
+     + (ts->tv_nsec - now.tv_nsec);
+  if (ns <= 0)
+    return 0;
+  ns = (ns + 999999) / 1000000;
+  return ns > INT_MAX ? INT_MAX : (int)ns;
 }
 
 static int device_open(struct usb_device *dev)
@@ -158,10 +187,8 @@ LIBUSB_API int usb_set_altinterface(usb_dev_handle *dev, int alternate)
 }
 
 /*
- * Linux usbfs has a limit of one page size for synchronous bulk read/write.
- * 4096 is the most portable maximum we can do for now.
- * Linux usbfs has a limit of 16KB for the URB interface. We use this now
- * to get better performance for USB 2.0 devices.
+ * Older kernels refuse a synchronous transfer of more than 16 KB, so
+ * bigger ones go in pieces.
  */
 #define MAX_READ_WRITE	(16 * 1024)
 
@@ -188,133 +215,62 @@ LIBUSB_API int usb_control_msg(usb_dev_handle *dev, int requesttype, int request
   return ret;
 }
 
-#define URB_USERCONTEXT_COOKIE		((void *)0x1)
-
-/* Reading and writing are the same except for the endpoint */
-static int usb_urb_transfer(usb_dev_handle *dev, int ep, int urbtype,
-	char *bytes, int size, int timeout)
+/*
+ * The four synchronous transfers. libusb-win32 does them all alike,
+ * whatever the type of the endpoint, and so does the kernel's blocking
+ * USBDEVFS_BULK, which picks bulk or interrupt from the endpoint. The old
+ * code here submitted interrupt URBs for usb_interrupt_read/write(), which
+ * the kernel refuses on bulk endpoints.
+ *
+ * USBDEVFS_BULK also stays out of the URB completion queue, so it can
+ * neither take nor lose a completion that belongs to an asynchronous
+ * request another thread has pending. The old code reaped from that
+ * shared queue, which broke programs that keep a read pending while they
+ * write.
+ *
+ * As in libusb-win32, a timeout of 0 (or less) means no timeout.
+ */
+static int usb_sync_transfer(usb_dev_handle *dev, int ep, char *bytes,
+	int size, int timeout)
 {
-  struct usb_urb urb;
-  int bytesdone = 0, requested;
-  struct timeval tv, tv_ref, tv_now;
-  struct usb_urb *context;
-  int ret, waiting;
+  struct usb_bulktransfer bulk;
+  struct timespec deadline;
+  int done = 0, requested, ret;
 
-  /*
-   * HACK: The use of urb.usercontext is a hack to get threaded applications
-   * sort of working again. Threaded support is still not recommended, but
-   * this should allow applications to work in the common cases. Basically,
-   * if we get the completion for an URB we're not waiting for, then we update
-   * the usercontext pointer to 1 for the other threads URB and it will see
-   * the change after it wakes up from the the timeout. Ugly, but it works.
-   */
-
-  /*
-   * Get actual time, and add the timeout value. The result is the absolute
-   * time where we have to quit waiting for an message.
-   */
-  gettimeofday(&tv_ref, NULL);
-  tv_ref.tv_sec = tv_ref.tv_sec + timeout / 1000;
-  tv_ref.tv_usec = tv_ref.tv_usec + (timeout % 1000) * 1000;
-
-  if (tv_ref.tv_usec > 1000000) {
-    tv_ref.tv_usec -= 1000000;
-    tv_ref.tv_sec++;
-  }
+  if (timeout > 0)
+    deadline_in(&deadline, timeout);
 
   do {
-    fd_set writefds;
-
-    requested = size - bytesdone;
+    requested = size - done;
     if (requested > MAX_READ_WRITE)
       requested = MAX_READ_WRITE;
 
-    urb.type = urbtype;
-    urb.endpoint = ep;
-    urb.flags = 0;
-    urb.buffer = bytes + bytesdone;
-    urb.buffer_length = requested;
-    urb.signr = 0;
-    urb.actual_length = 0;
-    urb.number_of_packets = 0;	/* don't do isochronous yet */
-    urb.usercontext = NULL;
-
-    ret = ioctl(dev->fd, IOCTL_USB_SUBMITURB, &urb);
-    if (ret < 0) {
-      USB_ERROR_STR(-errno, "error submitting URB: %s", strerror(errno));
-      return ret;
+    bulk.ep = ep;
+    bulk.len = requested;
+    bulk.data = bytes + done;
+    bulk.timeout = 0;			/* the kernel's "no timeout" */
+    if (timeout > 0) {
+      bulk.timeout = ms_left(&deadline);
+      if (!bulk.timeout)
+        USB_ERROR_STR(-ETRANSFER_TIMEDOUT, "transfer on ep 0x%02x timed out", ep);
     }
 
-    FD_ZERO(&writefds);
-    FD_SET(dev->fd, &writefds);
+    ret = ioctl(dev->fd, IOCTL_USB_BULK, &bulk);
+    if (ret < 0)
+      USB_ERROR_STR(win_error(errno), "transfer on ep 0x%02x failed: %s", ep,
+	strerror(errno));
 
-restart:
-    waiting = 1;
-    context = NULL;
-    while (!urb.usercontext && ((ret = ioctl(dev->fd, IOCTL_USB_REAPURBNDELAY, &context)) == -1) && waiting) {
-      tv.tv_sec = 0;
-      tv.tv_usec = 1000; // 1 msec
-      select(dev->fd + 1, NULL, &writefds, NULL, &tv); //sub second wait
+    done += ret;
+  } while (ret == requested && done < size);
 
-      if (timeout) {
-        /* compare with actual time, as the select timeout is not that precise */
-        gettimeofday(&tv_now, NULL);
-
-        if ((tv_now.tv_sec > tv_ref.tv_sec) ||
-            ((tv_now.tv_sec == tv_ref.tv_sec) && (tv_now.tv_usec >= tv_ref.tv_usec)))
-          waiting = 0;
-      }
-    }
-
-    if (context && context != &urb) {
-      context->usercontext = URB_USERCONTEXT_COOKIE;
-      /* We need to restart since we got a successful URB, but not ours */
-      goto restart;
-    }
-
-    /*
-     * If there was an error, that wasn't EAGAIN (no completion), then
-     * something happened during the reaping and we should return that
-     * error now
-     */
-    if (ret < 0 && !urb.usercontext && errno != EAGAIN)
-      USB_ERROR_STR(-errno, "error reaping URB: %s", strerror(errno));
-
-    bytesdone += urb.actual_length;
-  } while ((ret == 0 || urb.usercontext) && bytesdone < size && urb.actual_length == requested);
-
-  /* If the URB didn't complete in success or error, then let's unlink it */
-  if (ret < 0 && !urb.usercontext) {
-    int rc;
-
-    if (!waiting)
-      rc = -ETRANSFER_TIMEDOUT;
-    else
-      rc = urb.status;
-
-    ret = ioctl(dev->fd, IOCTL_USB_DISCARDURB, &urb);
-    if (ret < 0 && errno != EINVAL && usb_debug >= 1)
-      fprintf(stderr, "error discarding URB: %s", strerror(errno));
-
-    /*
-     * When the URB is unlinked, it gets moved to the completed list and
-     * then we need to reap it or else the next time we call this function,
-     * we'll get the previous completion and exit early
-     */
-    ioctl(dev->fd, IOCTL_USB_REAPURB, &context);
-
-    return rc;
-  }
-
-  return bytesdone;
+  return done;
 }
 
 LIBUSB_API int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int size,
 	int timeout)
 {
   /* Ensure the endpoint address is correct */
-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_BULK, bytes, size,
-		timeout);
+  return usb_sync_transfer(dev, ep, bytes, size, timeout);
 }
 
 LIBUSB_API int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
@@ -322,21 +278,14 @@ LIBUSB_API int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
 {
   /* Ensure the endpoint address is correct */
   ep |= USB_ENDPOINT_IN;
-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_BULK, bytes, size,
-		timeout);
+  return usb_sync_transfer(dev, ep, bytes, size, timeout);
 }
 
-/*
- * FIXME: Packetize large buffers here. 2.4 HCDs (atleast, haven't checked
- * 2.5 HCDs yet) don't handle multi-packet Interrupt transfers. So we need
- * to lookup the endpoint packet size and packetize appropriately here.
- */
 LIBUSB_API int usb_interrupt_write(usb_dev_handle *dev, int ep, char *bytes,
 	int size, int timeout)
 {
   /* Ensure the endpoint address is correct */
-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_INTERRUPT, bytes, size,
-		timeout);
+  return usb_sync_transfer(dev, ep, bytes, size, timeout);
 }
 
 LIBUSB_API int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes,
@@ -344,8 +293,7 @@ LIBUSB_API int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes,
 {
   /* Ensure the endpoint address is correct */
   ep |= USB_ENDPOINT_IN;
-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_INTERRUPT, bytes, size,
-		timeout);
+  return usb_sync_transfer(dev, ep, bytes, size, timeout);
 }
 
 int usb_os_find_busses(struct usb_bus **busses)
