@@ -24,8 +24,9 @@ LIBUSB_API const char *usb_strerror(void)
   case USB_ERROR_TYPE_STRING:
     return usb_error_str;
   case USB_ERROR_TYPE_ERRNO:
-    if (usb_error_errno > -USB_ERROR_BEGIN)
-      return strerror(usb_error_errno);
+    /* stored the way it is returned: negated */
+    if (usb_error_errno < 0 && usb_error_errno > -USB_ERROR_BEGIN)
+      return strerror(-usb_error_errno);
     else
       /* Any error we don't know falls under here */
       return "Unknown error";

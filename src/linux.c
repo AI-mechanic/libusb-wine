@@ -18,11 +18,33 @@
 #include "linux.h"
 #include "usbi.h"
 
-/* redefine linux ETIMEDOUT to match libusb-win32 ETIMEDOUT value */
-#undef ETIMEDOUT
-#define ETIMEDOUT 116
+/*
+ * libusb-win32's timeout error (from its error.h), the value Windows
+ * programs compare against. Linux's own ETIMEDOUT is 110.
+ */
+#define ETRANSFER_TIMEDOUT 116
 
 static char usb_path[PATH_MAX + 1] = "";
+
+/*
+ * libusb-win32 reports every failure as one of four errors
+ * (usb_win_error_to_errno() in its error.c): EINVAL, ETRANSFER_TIMEDOUT,
+ * ENOMEM and EIO. Windows programs were written against that set, so
+ * Linux's errors are folded into it.
+ */
+static int win_error(int err)
+{
+  switch (err) {
+  case EINVAL:
+    return -EINVAL;
+  case ENOMEM:
+    return -ENOMEM;
+  case ETIMEDOUT:
+    return -ETRANSFER_TIMEDOUT;
+  default:
+    return -EIO;
+  }
+}
 
 static int device_open(struct usb_device *dev)
 {
@@ -72,7 +94,7 @@ LIBUSB_API int usb_set_configuration(usb_dev_handle *dev, int configuration)
 
   ret = ioctl(dev->fd, IOCTL_USB_SETCONFIG, &configuration);
   if (ret < 0)
-    USB_ERROR_STR(-errno, "could not set config %d: %s", configuration,
+    USB_ERROR_STR(win_error(errno), "could not set config %d: %s", configuration,
 	strerror(errno));
 
   dev->config = configuration;
@@ -86,11 +108,13 @@ LIBUSB_API int usb_claim_interface(usb_dev_handle *dev, int interface)
 
   ret = ioctl(dev->fd, IOCTL_USB_CLAIMINTF, &interface);
   if (ret < 0) {
-    if (errno == EBUSY && usb_debug > 0)
+    int err = errno;
+
+    if (err == EBUSY && usb_debug > 0)
       fprintf(stderr, "Check that you have permissions to write to %s/%s and, if you don't, that you set up hotplug (http://linux-hotplug.sourceforge.net/) correctly.\n", dev->bus->dirname, dev->device->filename);
 
-    USB_ERROR_STR(-errno, "could not claim interface %d: %s", interface,
-	strerror(errno));
+    USB_ERROR_STR(win_error(err), "could not claim interface %d: %s", interface,
+	strerror(err));
   }
 
   dev->interface = interface;
@@ -104,7 +128,7 @@ LIBUSB_API int usb_release_interface(usb_dev_handle *dev, int interface)
 
   ret = ioctl(dev->fd, IOCTL_USB_RELEASEINTF, &interface);
   if (ret < 0)
-    USB_ERROR_STR(-errno, "could not release intf %d: %s", interface,
+    USB_ERROR_STR(win_error(errno), "could not release intf %d: %s", interface,
     	strerror(errno));
 
   dev->interface = -1;
@@ -125,7 +149,7 @@ LIBUSB_API int usb_set_altinterface(usb_dev_handle *dev, int alternate)
 
   ret = ioctl(dev->fd, IOCTL_USB_SETINTF, &setintf);
   if (ret < 0)
-    USB_ERROR_STR(-errno, "could not set alt intf %d/%d: %s",
+    USB_ERROR_STR(win_error(errno), "could not set alt intf %d/%d: %s",
 	dev->interface, alternate, strerror(errno));
 
   dev->altsetting = alternate;
@@ -158,7 +182,8 @@ LIBUSB_API int usb_control_msg(usb_dev_handle *dev, int requesttype, int request
 
   ret = ioctl(dev->fd, IOCTL_USB_CONTROL, &ctrl);
   if (ret < 0)
-    USB_ERROR_STR(-errno, "error sending control message: %s", strerror(errno));
+    USB_ERROR_STR(win_error(errno), "error sending control message: %s",
+	strerror(errno));
 
   return ret;
 }
@@ -263,7 +288,7 @@ restart:
     int rc;
 
     if (!waiting)
-      rc = -ETIMEDOUT;
+      rc = -ETRANSFER_TIMEDOUT;
     else
       rc = urb.status;
 
@@ -675,7 +700,7 @@ LIBUSB_API int usb_resetep(usb_dev_handle *dev, unsigned int ep)
 
   ret = ioctl(dev->fd, IOCTL_USB_RESETEP, &ep);
   if (ret)
-    USB_ERROR_STR(-errno, "could not reset ep %d: %s", ep,
+    USB_ERROR_STR(win_error(errno), "could not reset ep %d: %s", ep,
     	strerror(errno));
 
   return 0;
@@ -687,7 +712,7 @@ LIBUSB_API int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
 
   ret = ioctl(dev->fd, IOCTL_USB_CLEAR_HALT, &ep);
   if (ret)
-    USB_ERROR_STR(-errno, "could not clear/halt ep %d: %s", ep,
+    USB_ERROR_STR(win_error(errno), "could not clear/halt ep %d: %s", ep,
     	strerror(errno));
 
   return 0;
@@ -699,7 +724,7 @@ LIBUSB_API int usb_reset(usb_dev_handle *dev)
 
   ret = ioctl(dev->fd, IOCTL_USB_RESET, NULL);
   if (ret)
-     USB_ERROR_STR(-errno, "could not reset: %s", strerror(errno));
+     USB_ERROR_STR(win_error(errno), "could not reset: %s", strerror(errno));
 
   return 0;
 }
