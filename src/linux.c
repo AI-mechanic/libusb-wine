@@ -63,7 +63,7 @@ int usb_os_close(usb_dev_handle *dev)
   return 0;
 }
 
-int usb_set_configuration(usb_dev_handle *dev, int configuration)
+LIBUSB_API int usb_set_configuration(usb_dev_handle *dev, int configuration)
 {
   int ret;
 
@@ -80,7 +80,7 @@ int usb_set_configuration(usb_dev_handle *dev, int configuration)
   return 0;
 }
 
-int usb_claim_interface(usb_dev_handle *dev, int interface)
+LIBUSB_API int usb_claim_interface(usb_dev_handle *dev, int interface)
 {
   int ret;
 
@@ -98,7 +98,7 @@ int usb_claim_interface(usb_dev_handle *dev, int interface)
   return 0;
 }
 
-int usb_release_interface(usb_dev_handle *dev, int interface)
+LIBUSB_API int usb_release_interface(usb_dev_handle *dev, int interface)
 {
   int ret;
 
@@ -112,7 +112,7 @@ int usb_release_interface(usb_dev_handle *dev, int interface)
   return 0;
 }
 
-int usb_set_altinterface(usb_dev_handle *dev, int alternate)
+LIBUSB_API int usb_set_altinterface(usb_dev_handle *dev, int alternate)
 {
   int ret;
   struct usb_setinterface setintf;
@@ -141,7 +141,7 @@ int usb_set_altinterface(usb_dev_handle *dev, int alternate)
  */
 #define MAX_READ_WRITE	(16 * 1024)
 
-int usb_control_msg(usb_dev_handle *dev, int requesttype, int request,
+LIBUSB_API int usb_control_msg(usb_dev_handle *dev, int requesttype, int request,
 	int value, int index, char *bytes, int size, int timeout)
 {
   struct usb_ctrltransfer ctrl;
@@ -284,7 +284,7 @@ restart:
   return bytesdone;
 }
 
-int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int size,
+LIBUSB_API int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int size,
 	int timeout)
 {
   /* Ensure the endpoint address is correct */
@@ -292,7 +292,7 @@ int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int size,
 		timeout);
 }
 
-int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
+LIBUSB_API int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
 	int timeout)
 {
   /* Ensure the endpoint address is correct */
@@ -306,16 +306,16 @@ int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
  * 2.5 HCDs yet) don't handle multi-packet Interrupt transfers. So we need
  * to lookup the endpoint packet size and packetize appropriately here.
  */
-int usb_interrupt_write(usb_dev_handle *dev, int ep, char *bytes, int size,
-	int timeout)
+LIBUSB_API int usb_interrupt_write(usb_dev_handle *dev, int ep, char *bytes,
+	int size, int timeout)
 {
   /* Ensure the endpoint address is correct */
   return usb_urb_transfer(dev, ep, USB_URB_TYPE_INTERRUPT, bytes, size,
 		timeout);
 }
 
-int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes, int size,
-	int timeout)
+LIBUSB_API int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes,
+	int size, int timeout)
 {
   /* Ensure the endpoint address is correct */
   ep |= USB_ENDPOINT_IN;
@@ -669,7 +669,7 @@ void usb_os_init(void)
   }
 }
 
-int usb_resetep(usb_dev_handle *dev, unsigned int ep)
+LIBUSB_API int usb_resetep(usb_dev_handle *dev, unsigned int ep)
 {
   int ret;
 
@@ -681,7 +681,7 @@ int usb_resetep(usb_dev_handle *dev, unsigned int ep)
   return 0;
 }
 
-int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
+LIBUSB_API int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
 {
   int ret;
 
@@ -693,7 +693,7 @@ int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
   return 0;
 }
 
-int usb_reset(usb_dev_handle *dev)
+LIBUSB_API int usb_reset(usb_dev_handle *dev)
 {
   int ret;
 
@@ -704,7 +704,7 @@ int usb_reset(usb_dev_handle *dev)
   return 0;
 }
 
-int usb_get_driver_np(usb_dev_handle *dev, int interface, char *name,
+LIBUSB_API int usb_get_driver_np(usb_dev_handle *dev, int interface, char *name,
 	unsigned int namelen)
 {
   struct usb_getdriver getdrv;
@@ -721,7 +721,7 @@ int usb_get_driver_np(usb_dev_handle *dev, int interface, char *name,
   return 0;
 }
 
-int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface)
+LIBUSB_API int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface)
 {
   struct usb_ioctl command;
   int ret;
@@ -780,13 +780,14 @@ static int _usb_setup_async(usb_dev_handle *dev, void **context,
 	return 0;
 }
 
-int usb_bulk_setup_async(usb_dev_handle *dev, void **context, unsigned char ep)
+LIBUSB_API int usb_bulk_setup_async(usb_dev_handle *dev, void **context,
+	unsigned char ep)
 {
 	return _usb_setup_async(dev, context, USB_URB_TYPE_BULK, ep, 0);
 }
 
 /* Reading and writing are the same except for the endpoint */
-int usb_submit_async(void *context, char *bytes, int size)
+LIBUSB_API int usb_submit_async(void *context, char *bytes, int size)
 {
 	int ret;
 
@@ -839,18 +840,18 @@ again:
 	return urb->actual_length;
 }
 
-int usb_reap_async(void *context, int timeout)
+LIBUSB_API int usb_reap_async(void *context, int timeout)
 {
 	return _usb_reap_async(context, timeout, 1);
 }
 
-int usb_reap_async_nocancel(void *context, int timeout)
+LIBUSB_API int usb_reap_async_nocancel(void *context, int timeout)
 {
 	return _usb_reap_async(context, timeout, 0);
 }
 
 
-int usb_cancel_async(void *context)
+LIBUSB_API int usb_cancel_async(void *context)
 {
 	printf("%s()\n", __func__);
 	USB_ERROR_STR(-errno, "usb_cancel_async is not yet implemented: %s\n", strerror(errno));
@@ -894,7 +895,7 @@ int usb_cancel_async(void *context)
 	return 0;
 }
 
-int usb_free_async(void **context)
+LIBUSB_API int usb_free_async(void **context)
 {
 	usb_context_t **c = (usb_context_t **)context;
 

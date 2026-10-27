@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include "usbi.h"
 
-int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
+LIBUSB_API int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
 	unsigned char type, unsigned char index, void *buf, int size)
 {
   memset(buf, 0, size);
@@ -20,7 +20,7 @@ int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
                         (type << 8) + index, 0, buf, size, 1000);
 }
 
-int usb_get_descriptor(usb_dev_handle *udev, unsigned char type,
+LIBUSB_API int usb_get_descriptor(usb_dev_handle *udev, unsigned char type,
 	unsigned char index, void *buf, int size)
 {
   memset(buf, 0, size);

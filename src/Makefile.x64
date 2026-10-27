@@ -19,7 +19,9 @@ CFLAGS = -g -O2 \
   -Wno-format-truncation \
   -gdwarf-2 \
   -gstrict-dwarf \
-  -fno-omit-frame-pointer
+  -fno-omit-frame-pointer \
+  -Werror=missing-prototypes \
+  -Werror=implicit-function-declaration
 
 LDFLAGS =
 

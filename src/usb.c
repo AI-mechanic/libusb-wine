@@ -16,7 +16,7 @@
 int usb_debug = 0;
 struct usb_bus *usb_busses = NULL;
 
-int usb_find_busses(void)
+LIBUSB_API int usb_find_busses(void)
 {
   struct usb_bus *busses, *bus;
   int ret, changes = 0;
@@ -86,7 +86,7 @@ int usb_find_busses(void)
   return changes;
 }
 
-int usb_find_devices(void)
+LIBUSB_API int usb_find_devices(void)
 {
   struct usb_bus *bus;
   int ret, changes = 0;
@@ -178,7 +178,7 @@ int usb_find_devices(void)
   return changes;
 }
 
-void usb_set_debug(int level)
+LIBUSB_API void usb_set_debug(int level)
 {
   if (usb_debug || level)
     fprintf(stderr, "usb_set_debug: Setting debugging level to %d (%s)\n",
@@ -187,7 +187,7 @@ void usb_set_debug(int level)
   usb_debug = level;
 }
 
-void usb_init(void)
+LIBUSB_API void usb_init(void)
 {
   if (getenv("USB_DEBUG"))
     usb_set_debug(atoi(getenv("USB_DEBUG")));
@@ -195,7 +195,7 @@ void usb_init(void)
   usb_os_init();
 }
 
-usb_dev_handle *usb_open(struct usb_device *dev)
+LIBUSB_API usb_dev_handle *usb_open(struct usb_device *dev)
 {
   usb_dev_handle *udev;
 
@@ -216,8 +216,8 @@ usb_dev_handle *usb_open(struct usb_device *dev)
   return udev;
 }
 
-int usb_get_string(usb_dev_handle *dev, int index, int langid, char *buf,
-	size_t buflen)
+LIBUSB_API int usb_get_string(usb_dev_handle *dev, int index, int langid,
+	char *buf, size_t buflen)
 {
   /*
    * We can't use usb_get_descriptor() because it's lacking the index
@@ -227,7 +227,8 @@ int usb_get_string(usb_dev_handle *dev, int index, int langid, char *buf,
 			(USB_DT_STRING << 8) + index, langid, buf, buflen, 1000);
 }
 
-int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf, size_t buflen)
+LIBUSB_API int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf,
+	size_t buflen)
 {
   char tbuf[255];	/* Some devices choke on size > 255 */
   int ret, langid, si, di;
@@ -273,7 +274,7 @@ int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf, size_t bufl
   return di;
 }
 
-int usb_close(usb_dev_handle *dev)
+LIBUSB_API int usb_close(usb_dev_handle *dev)
 {
   int ret;
 
@@ -283,7 +284,7 @@ int usb_close(usb_dev_handle *dev)
   return ret;
 }
 
-struct usb_device *usb_device(usb_dev_handle *dev)
+LIBUSB_API struct usb_device *usb_device(usb_dev_handle *dev)
 {
   return dev->device;
 }
@@ -295,7 +296,7 @@ void usb_free_dev(struct usb_device *dev)
   free(dev);
 }
 
-struct usb_bus *usb_get_busses(void)
+LIBUSB_API struct usb_bus *usb_get_busses(void)
 {
   return usb_busses;
 }

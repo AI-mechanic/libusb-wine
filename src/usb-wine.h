@@ -6,6 +6,8 @@
 #ifndef __USB_WINE_H__
 #define __USB_WINE_H__
 
+#include "usb.h"
+
 #define VERSION_MAJOR 0
 #define VERSION_MINOR 1
 #define VERSION_MICRO 12
@@ -26,5 +28,7 @@ struct usb_version {
     int nano;
   } driver;
 };
+
+LIBUSB_API const struct usb_version *usb_get_version(void);
 
 #endif /* __USB_WINE_H__ */
