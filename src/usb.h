@@ -361,6 +361,8 @@ LIBUSB_API struct usb_bus *usb_get_busses(void);
 
 LIBUSB_API int usb_bulk_setup_async(usb_dev_handle *dev, void **context,
 	unsigned char ep);
+LIBUSB_API int usb_interrupt_setup_async(usb_dev_handle *dev, void **context,
+	unsigned char ep);
 
 LIBUSB_API int usb_submit_async(void *context, char *bytes, int size);
 LIBUSB_API int usb_reap_async(void *context, int timeout);

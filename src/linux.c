@@ -786,6 +786,17 @@ LIBUSB_API int usb_bulk_setup_async(usb_dev_handle *dev, void **context,
 	return _usb_setup_async(dev, context, USB_URB_TYPE_BULK, ep, 0);
 }
 
+/*
+ * libusb-win32 handles interrupt endpoints exactly like bulk ones. So can
+ * we: the kernel turns a bulk URB on an interrupt endpoint into an
+ * interrupt transfer, while it refuses an interrupt URB on a bulk one.
+ */
+LIBUSB_API int usb_interrupt_setup_async(usb_dev_handle *dev, void **context,
+	unsigned char ep)
+{
+	return _usb_setup_async(dev, context, USB_URB_TYPE_BULK, ep, 0);
+}
+
 /* Reading and writing are the same except for the endpoint */
 LIBUSB_API int usb_submit_async(void *context, char *bytes, int size)
 {
