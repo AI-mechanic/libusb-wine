@@ -51,6 +51,24 @@ _Static_assert(IOCTL_USB_DISCONNECT_CLAIM == USBDEVFS_DISCONNECT_CLAIM,
 
 static char usb_path[PATH_MAX + 1] = "";
 
+/* LIBUSB0_ALL_DEVICES=1: list every device, not only the usable ones */
+static int list_all_devices;
+
+/*
+ * libusb-win32 sees no real hubs. It makes one up for each bus and hangs
+ * every device it lists off that (usb_os_determine_children() in its
+ * windows.c), and so does this when it lists only the usable devices. A
+ * bus is allocated together with its virtual hub, so freeing the bus
+ * frees both.
+ */
+#define MAX_DEVICES_PER_BUS	128	/* USB addresses go up to 127 */
+
+struct linux_bus {
+  struct usb_bus bus;		/* first: the rest of the library sees only this */
+  struct usb_device hub;
+  struct usb_device *children[MAX_DEVICES_PER_BUS];
+};
+
 /* per-device state for the asynchronous API, at the end of this file */
 static int async_open(usb_dev_handle *dev);
 static int async_close(usb_dev_handle *dev);
@@ -462,12 +480,19 @@ int usb_os_find_busses(struct usb_bus **busses)
   DIR *dir;
   struct dirent *entry;
 
+  /* no USB at all, as in a container: no busses, which is no error */
+  if (!usb_path[0]) {
+    *busses = NULL;
+    return 0;
+  }
+
   dir = opendir(usb_path);
   if (!dir)
     USB_ERROR_STR(-errno, "couldn't opendir(%s): %s", usb_path,
 	strerror(errno));
 
   while ((entry = readdir(dir)) != NULL) {
+    struct linux_bus *lbus;
     struct usb_bus *bus;
 
     /* Skip anything starting with a . */
@@ -481,11 +506,10 @@ int usb_os_find_busses(struct usb_bus **busses)
       continue;
     }
 
-    bus = malloc(sizeof(*bus));
-    if (!bus)
+    lbus = calloc(1, sizeof(*lbus));
+    if (!lbus)
       USB_ERROR(-ENOMEM);
-
-    memset((void *)bus, 0, sizeof(*bus));
+    bus = &lbus->bus;
 
     strncpy(bus->dirname, entry->d_name, sizeof(bus->dirname) - 1);
     bus->dirname[sizeof(bus->dirname) - 1] = 0;
@@ -522,7 +546,7 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
     char filename[PATH_MAX + 1];
     struct usb_device *dev;
     struct usb_connectinfo connectinfo;
-    int i, fd, ret;
+    int i, fd, ret, writable;
 
     /* Skip anything starting with a . */
     if (entry->d_name[0] == '.')
@@ -541,6 +565,7 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
 
     snprintf(filename, sizeof(filename) - 1, "%s/%s", dirpath, entry->d_name);
     fd = open(filename, O_RDWR);
+    writable = fd >= 0;
     if (fd < 0) {
       fd = open(filename, O_RDONLY);
       if (fd < 0) {
@@ -577,6 +602,24 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
      * doesn't convert endianess when parsing the descriptor
      */
     usb_parse_descriptor(device_desc, "bbWbbbbWWWbbbb", &dev->descriptor);
+
+    /*
+     * libusb-win32 lists only the devices bound to its driver, the ones a
+     * program can use. List the same kind here: devices this user may open
+     * for writing (usbfs refuses every request on a read-only file), and
+     * no hubs. Programs probe what they are shown -- ANT_DLL opens,
+     * configures and claims every device -- and this keeps them off the
+     * rest. LIBUSB0_ALL_DEVICES=1 lists everything.
+     */
+    if (!list_all_devices &&
+        (!writable || dev->descriptor.bDeviceClass == USB_CLASS_HUB)) {
+      if (usb_debug >= 2)
+        fprintf(stderr, "usb_os_find_devices: Skipping %s on %s (%04x:%04x, %s)\n",
+		dev->filename, bus->dirname, dev->descriptor.idVendor,
+		dev->descriptor.idProduct, writable ? "a hub" : "not writable");
+      free(dev);
+      goto err;
+    }
 
     LIST_ADD(fdev, dev);
 
@@ -671,6 +714,30 @@ int usb_os_determine_children(struct usb_bus *bus)
   struct usb_ioctl command;
   int ret, i, i1;
 
+  if (!list_all_devices) {
+    struct linux_bus *lbus = (struct linux_bus *)bus;
+    struct usb_device *hub = &lbus->hub;
+
+    /* the device descriptor libusb-win32 gives its virtual hub */
+    strcpy(hub->filename, "virtual-hub");
+    hub->bus = bus;
+    hub->descriptor.bLength = USB_DT_DEVICE_SIZE;
+    hub->descriptor.bDescriptorType = USB_DT_DEVICE;
+    hub->descriptor.bcdUSB = 0x0200;
+    hub->descriptor.bDeviceClass = USB_CLASS_HUB;
+    hub->descriptor.bMaxPacketSize0 = 64;
+    hub->descriptor.bcdDevice = 0x0100;
+
+    hub->children = lbus->children;
+    hub->num_children = 0;
+    for (dev = bus->devices; dev && hub->num_children < MAX_DEVICES_PER_BUS;
+         dev = dev->next)
+      hub->children[hub->num_children++] = dev;
+
+    bus->root_dev = hub;
+    return 0;
+  }
+
   /* Create a list of devices first */
   memset(devices, 0, sizeof(devices));
   for (dev = bus->devices; dev; dev = dev->next)
@@ -681,6 +748,10 @@ int usb_os_determine_children(struct usb_bus *bus)
   for (dev = bus->devices; dev; dev = dev->next) {
     struct usb_hub_portinfo portinfo;
     int fd;
+
+    /* only hubs have children: leave the other devices alone */
+    if (dev->descriptor.bDeviceClass != USB_CLASS_HUB)
+      continue;
 
     fd = device_open(dev);
     if (fd < 0)
@@ -774,6 +845,10 @@ static int check_usb_vfs(const char *dirname)
 
 void usb_os_init(void)
 {
+  const char *all = getenv("LIBUSB0_ALL_DEVICES");
+
+  list_all_devices = all && atoi(all) != 0;
+
   /* Find the path to the virtual filesystem */
   if (getenv("USB_DEVFS_PATH")) {
     if (check_usb_vfs(getenv("USB_DEVFS_PATH"))) {
