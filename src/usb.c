@@ -199,6 +199,11 @@ LIBUSB_API usb_dev_handle *usb_open(struct usb_device *dev)
 {
   usb_dev_handle *udev;
 
+  if (!dev || !dev->bus) {
+    USB_ERROR_SET("usb_open: invalid device");
+    return NULL;
+  }
+
   udev = malloc(sizeof(*udev));
   if (!udev)
     return NULL;
@@ -207,6 +212,7 @@ LIBUSB_API usb_dev_handle *usb_open(struct usb_device *dev)
   udev->device = dev;
   udev->bus = dev->bus;
   udev->config = udev->interface = udev->altsetting = -1;
+  udev->impl_info = NULL;
 
   if (usb_os_open(udev) < 0) {
     free(udev);
@@ -230,8 +236,11 @@ LIBUSB_API int usb_get_string(usb_dev_handle *dev, int index, int langid,
 LIBUSB_API int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf,
 	size_t buflen)
 {
-  char tbuf[255];	/* Some devices choke on size > 255 */
+  unsigned char tbuf[255];	/* Some devices choke on size > 255 */
   int ret, langid, si, di;
+
+  if (!buf || !buflen)
+    USB_ERROR_STR(-EINVAL, "usb_get_string_simple: invalid buffer");
 
   /*
    * Asking for the zero'th index is special - it returns a string
@@ -240,7 +249,7 @@ LIBUSB_API int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf,
    * language IDs are 16 bit numbers, and they start at the third byte
    * in the descriptor. See USB 2.0 specification, section 9.6.7, for
    * more information on this. */
-  ret = usb_get_string(dev, 0, 0, tbuf, sizeof(tbuf));
+  ret = usb_get_string(dev, 0, 0, (char *)tbuf, sizeof(tbuf));
   if (ret < 0)
     return ret;
 
@@ -249,18 +258,20 @@ LIBUSB_API int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf,
 
   langid = tbuf[2] | (tbuf[3] << 8);
 
-  ret = usb_get_string(dev, index, langid, tbuf, sizeof(tbuf));
+  ret = usb_get_string(dev, index, langid, (char *)tbuf, sizeof(tbuf));
   if (ret < 0)
     return ret;
 
-  if (tbuf[1] != USB_DT_STRING)
+  if (ret < 2 || tbuf[1] != USB_DT_STRING)
     return -EIO;
 
   if (tbuf[0] > ret)
     return -EFBIG;
 
-  for (di = 0, si = 2; si < tbuf[0]; si += 2) {
-    if (di >= (buflen - 1))
+  /* stop at the last whole UTF-16 code unit: bLength may be odd, and as
+     large as tbuf */
+  for (di = 0, si = 2; si + 1 < tbuf[0]; si += 2) {
+    if (di >= (int)(buflen - 1))
       break;
 
     if (tbuf[si + 1])	/* high byte */
@@ -278,6 +289,9 @@ LIBUSB_API int usb_close(usb_dev_handle *dev)
 {
   int ret;
 
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "usb_close: invalid device handle");
+
   ret = usb_os_close(dev);
   free(dev);
 
@@ -286,7 +300,7 @@ LIBUSB_API int usb_close(usb_dev_handle *dev)
 
 LIBUSB_API struct usb_device *usb_device(usb_dev_handle *dev)
 {
-  return dev->device;
+  return dev ? dev->device : NULL;
 }
 
 void usb_free_dev(struct usb_device *dev)

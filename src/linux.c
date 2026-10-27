@@ -129,9 +129,9 @@ static int device_open(struct usb_device *dev)
   snprintf(filename, sizeof(filename) - 1, "%s/%s/%s",
     usb_path, dev->bus->dirname, dev->filename);
 
-  fd = open(filename, O_RDWR);
+  fd = open(filename, O_RDWR | O_CLOEXEC);
   if (fd < 0) {
-    fd = open(filename, O_RDONLY);
+    fd = open(filename, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
       USB_ERROR_STR(-errno, "failed to open %s: %s",
 	filename, strerror(errno));
@@ -231,6 +231,10 @@ LIBUSB_API int usb_set_configuration(usb_dev_handle *dev, int configuration)
 {
   int ret;
 
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "could not set config %d: invalid device handle",
+      configuration);
+
   /*
    * As in libusb-win32: asking for the configuration the device is already
    * in does nothing, and no interface may be claimed. Linux would reset
@@ -294,6 +298,10 @@ LIBUSB_API int usb_claim_interface(usb_dev_handle *dev, int interface)
   struct usb_disconnect_claim dc;
   int ret, err;
 
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "could not claim interface %d: invalid device handle",
+      interface);
+
   /* the checks libusb-win32 makes */
   if (!dev->config)
     USB_ERROR_STR(-EINVAL, "could not claim interface %d: device not configured",
@@ -332,6 +340,10 @@ LIBUSB_API int usb_release_interface(usb_dev_handle *dev, int interface)
 {
   int ret;
 
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "could not release intf %d: invalid device handle",
+      interface);
+
   ret = ioctl(dev->fd, IOCTL_USB_RELEASEINTF, &interface);
   if (ret < 0)
     USB_ERROR_STR(win_error(errno), "could not release intf %d: %s", interface,
@@ -347,6 +359,10 @@ LIBUSB_API int usb_set_altinterface(usb_dev_handle *dev, int alternate)
 {
   int ret;
   struct usb_setinterface setintf;
+
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "could not set alt intf %d: invalid device handle",
+      alternate);
 
   if (dev->interface < 0)
     USB_ERROR(-EINVAL);
@@ -375,6 +391,9 @@ LIBUSB_API int usb_control_msg(usb_dev_handle *dev, int requesttype, int request
 {
   struct usb_ctrltransfer ctrl;
   int ret;
+
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "error sending control message: invalid device handle");
 
   ctrl.bRequestType = requesttype;
   ctrl.bRequest = request;
@@ -414,6 +433,9 @@ static int usb_sync_transfer(usb_dev_handle *dev, int ep, char *bytes,
   struct usb_bulktransfer bulk;
   struct timespec deadline;
   int done = 0, requested, ret;
+
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "transfer on ep 0x%02x: invalid device handle", ep);
 
   if (timeout > 0)
     deadline_in(&deadline, timeout);
@@ -507,8 +529,10 @@ int usb_os_find_busses(struct usb_bus **busses)
     }
 
     lbus = calloc(1, sizeof(*lbus));
-    if (!lbus)
+    if (!lbus) {
+      closedir(dir);
       USB_ERROR(-ENOMEM);
+    }
     bus = &lbus->bus;
 
     strncpy(bus->dirname, entry->d_name, sizeof(bus->dirname) - 1);
@@ -553,8 +577,10 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
       continue;
 
     dev = malloc(sizeof(*dev));
-    if (!dev)
+    if (!dev) {
+      closedir(dir);
       USB_ERROR(-ENOMEM);
+    }
 
     memset((void *)dev, 0, sizeof(*dev));
 
@@ -564,10 +590,10 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
     dev->filename[sizeof(dev->filename) - 1] = 0;
 
     snprintf(filename, sizeof(filename) - 1, "%s/%s", dirpath, entry->d_name);
-    fd = open(filename, O_RDWR);
+    fd = open(filename, O_RDWR | O_CLOEXEC);
     writable = fd >= 0;
     if (fd < 0) {
-      fd = open(filename, O_RDONLY);
+      fd = open(filename, O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
         if (usb_debug >= 2)
           fprintf(stderr, "usb_os_find_devices: Couldn't open %s\n",
@@ -583,11 +609,13 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
     if (ret < 0) {
       if (usb_debug)
         fprintf(stderr, "usb_os_find_devices: couldn't get connect info\n");
+      /* refused on a read-only file; usbfs names the node after it */
+      dev->devnum = atoi(entry->d_name);
     } else
       dev->devnum = connectinfo.devnum;
 
     ret = read(fd, (void *)device_desc, DEVICE_DESC_LENGTH);
-    if (ret < 0) {
+    if (ret < DEVICE_DESC_LENGTH) {
       if (usb_debug)
         fprintf(stderr, "usb_os_find_devices: Couldn't read descriptor\n");
 
@@ -662,6 +690,14 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
       }
 
       usb_parse_descriptor(buffer, "bbw", &config);
+
+      /* a shorter one would make the copy below overrun bigbuffer */
+      if (config.wTotalLength < 8) {
+        if (usb_debug >= 1)
+          fprintf(stderr, "Config descriptor too short (wTotalLength %d)\n",
+                  config.wTotalLength);
+        goto err;
+      }
 
       bigbuffer = malloc(config.wTotalLength);
       if (!bigbuffer) {
@@ -775,9 +811,10 @@ int usb_os_determine_children(struct usb_bus *bus)
       continue;
     }
 
+    /* ports whose device is not listed are left out */
     dev->num_children = 0;
     for (i = 0; i < portinfo.numports; i++)
-      if (portinfo.port[i])
+      if (portinfo.port[i] && devices[portinfo.port[i]])
         dev->num_children++;
 
     /* Free any old children first */
@@ -795,7 +832,7 @@ int usb_os_determine_children(struct usb_bus *bus)
     }
 
     for (i = 0, i1 = 0; i < portinfo.numports; i++) {
-      if (!portinfo.port[i])
+      if (!portinfo.port[i] || !devices[portinfo.port[i]])
         continue;
 
       dev->children[i1++] = devices[portinfo.port[i]];
@@ -881,6 +918,9 @@ LIBUSB_API int usb_resetep(usb_dev_handle *dev, unsigned int ep)
 {
   int ret;
 
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "could not reset ep %d: invalid device handle", ep);
+
   ret = ioctl(dev->fd, IOCTL_USB_RESETEP, &ep);
   if (ret)
     USB_ERROR_STR(win_error(errno), "could not reset ep %d: %s", ep,
@@ -893,6 +933,9 @@ LIBUSB_API int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
 {
   int ret;
 
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "could not clear/halt ep %d: invalid device handle", ep);
+
   ret = ioctl(dev->fd, IOCTL_USB_CLEAR_HALT, &ep);
   if (ret)
     USB_ERROR_STR(win_error(errno), "could not clear/halt ep %d: %s", ep,
@@ -904,6 +947,9 @@ LIBUSB_API int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
 LIBUSB_API int usb_reset(usb_dev_handle *dev)
 {
   int ret;
+
+  if (!dev)
+    USB_ERROR_STR(-EINVAL, "could not reset: invalid device handle");
 
   ret = ioctl(dev->fd, IOCTL_USB_RESET, NULL);
   if (ret)

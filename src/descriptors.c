@@ -9,11 +9,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include "usbi.h"
 
 LIBUSB_API int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
 	unsigned char type, unsigned char index, void *buf, int size)
 {
+  if (!buf || size < 0)
+    USB_ERROR_STR(-EINVAL, "usb_get_descriptor_by_endpoint: invalid buffer");
+
   memset(buf, 0, size);
 
   return usb_control_msg(udev, ep | USB_ENDPOINT_IN, USB_REQ_GET_DESCRIPTOR,
@@ -23,6 +27,9 @@ LIBUSB_API int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
 LIBUSB_API int usb_get_descriptor(usb_dev_handle *udev, unsigned char type,
 	unsigned char index, void *buf, int size)
 {
+  if (!buf || size < 0)
+    USB_ERROR_STR(-EINVAL, "usb_get_descriptor: invalid buffer");
+
   memset(buf, 0, size);
 
   return usb_control_msg(udev, USB_ENDPOINT_IN, USB_REQ_GET_DESCRIPTOR,
